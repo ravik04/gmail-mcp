@@ -77,6 +77,11 @@ from googleapiclient.errors import HttpError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global MCP server (required for FastMCP Cloud inspection)
+server = Server("gmail")
+gmail_service: "GmailService | None" = None
+_handlers_registered = False
+
 EMAIL_ADMIN_PROMPTS = """You are an email administrator. 
 You can draft, edit, read, trash, open, and send emails.
 You've been given access to a specific gmail account. 
@@ -1308,15 +1313,13 @@ def create_fastapi_app(gmail_service: GmailService, server: Server):
     # Return wrapped app for proper MCP SSE handling
     return MCPWrapper(app)
 
-async def main(creds_file_path: str | None,
-               token_path: str | None,
-               mode: str = 'mcp',
-               port: int = 8000):
-    
-    gmail_service = GmailService(creds_file_path, token_path)
-    
-    # Create server instance (used for both modes)
-    server = Server("gmail")
+def register_handlers(service: GmailService) -> None:
+    global gmail_service, _handlers_registered
+
+    if _handlers_registered:
+        return
+
+    gmail_service = service
 
     @server.list_prompts()
     async def handle_list_prompts() -> list[types.Prompt]:
@@ -2250,6 +2253,17 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
         else:
             logger.error(f"Unknown tool: {name}")
             raise ValueError(f"Unknown tool: {name}")
+
+    _handlers_registered = True
+
+
+async def main(creds_file_path: str | None,
+               token_path: str | None,
+               mode: str = 'mcp',
+               port: int = 8000):
+    
+    service = GmailService(creds_file_path, token_path)
+    register_handlers(service)
 
     # Choose mode
     if mode == 'api':

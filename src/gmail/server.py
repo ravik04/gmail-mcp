@@ -1,4 +1,5 @@
-from typing import Any, Optional
+from typing import Any, Optional, Callable
+import inspect
 import argparse
 import os
 import asyncio
@@ -16,209 +17,226 @@ from email.mime.text import MIMEText
 import webbrowser
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import StreamingResponse
-from pydantic import BaseModel
-import uvicorn
-from mcp.server.sse import SseServerTransport
-
-from mcp.server.models import InitializationOptions
-import mcp.types as types
-from mcp.server import NotificationOptions, Server
-import mcp.server.stdio
-
-# FastAPI models
-class EmailSendRequest(BaseModel):
-    recipient_id: str
-    subject: str
-    message: str
-
-class DraftCreateRequest(BaseModel):
-    recipient_id: str
-    subject: str
-    message: str
-
-class DraftUpdateRequest(BaseModel):
-    draft_id: str
-    message: str
-
-class AttachmentRequest(BaseModel):
-    draft_id: str
-    file_path: str
-
-class SearchRequest(BaseModel):
-    query: str
-    max_results: Optional[int] = 50
-
-class LabelCreateRequest(BaseModel):
-    name: str
-
-class LabelApplyRequest(BaseModel):
-    email_id: str
-    label_id: str
-
-class FolderCreateRequest(BaseModel):
-    name: str
-
-class MoveFolderRequest(BaseModel):
-    email_id: str
-    folder_id: str
-
-
-from google.auth.transport.requests import Request as GoogleRequest
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Global MCP server (required for FastMCP Cloud inspection)
-mcp = Server("gmail")
-server = mcp
-app = mcp
-gmail_service: "GmailService | None" = None
-_handlers_registered = False
-
-EMAIL_ADMIN_PROMPTS = """You are an email administrator. 
-You can draft, edit, read, trash, open, and send emails.
-You've been given access to a specific gmail account. 
-You have the following tools available:
-- Send an email (send-email)
-- Create a draft email (create-draft)
-- List draft emails (list-drafts)
-- Retrieve unread emails (get-unread-emails)
-- Read email content (read-email)
-- Trash email (trash-email)
-- Open email in browser (open-email)
-- List all labels (list-labels)
-- Create a new label (create-label)
-- Apply a label to an email (apply-label)
-- Remove a label from an email (remove-label)
-- Rename a label (rename-label)
-- Delete a label (delete-label)
-- Search for emails with a specific label (search-by-label)
-- Search for emails using Gmail's search syntax (search-emails)
-- List all email filters (list-filters)
-- Get details of a specific filter (get-filter)
-- Create a new email filter (create-filter)
-- Delete a filter (delete-filter)
-- Create a new folder (create-folder)
-- Move an email to a folder (move-to-folder)
-- List all folders (list-folders)
-- Archive an email (archive-email)
-- Batch archive emails (batch-archive)
-- List archived emails (list-archived)
-- Restore an email to inbox (restore-to-inbox)
-
-Never send an email draft or trash an email unless the user confirms first. 
-Always ask for approval if not already given.
-"""
-
-# Define available prompts
-PROMPTS = {
-    "manage-email": types.Prompt(
-        name="manage-email",
-        description="Act like an email administator",
-        arguments=None,
-    ),
-    "draft-email": types.Prompt(
-        name="draft-email",
-        description="Draft an email with cotent and recipient",
-        arguments=[
-            types.PromptArgument(
-                name="content",
-                description="What the email is about",
-                required=True
-            ),
-            types.PromptArgument(
-                name="recipient",
-                description="Who should the email be addressed to",
-                required=True
-            ),
-            types.PromptArgument(
-                name="recipient_email",
-                description="Recipient's email address",
-                required=True
-            ),
-        ],
-    ),
-    "edit-draft": types.Prompt(
-        name="edit-draft",
-        description="Edit the existing email draft",
-        arguments=[
-            types.PromptArgument(
-                name="changes",
-                description="What changes should be made to the draft",
-                required=True
-            ),
-            types.PromptArgument(
-                name="current_draft",
-                description="The current draft to edit",
-                required=True
-            ),
-        ],
-    ),
-    "manage-labels": types.Prompt(
-        name="manage-labels",
-        description="Manage email labels for organization",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with labels (create, list, apply, remove, search)",
-                required=True
-            ),
-        ],
-    ),
-    "manage-filters": types.Prompt(
-        name="manage-filters",
-        description="Manage email filters for automation",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with filters (create, list, view, delete)",
-                required=True
-            ),
-        ],
-    ),
-    "search-emails": types.Prompt(
-        name="search-emails",
-        description="Search for emails using Gmail's search syntax",
-        arguments=[
-            types.PromptArgument(
-                name="query",
-                description="What to search for in emails",
-                required=True
-            ),
-        ],
-    ),
-    "manage-folders": types.Prompt(
-        name="manage-folders",
-        description="Manage email folders for organization",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with folders (create, list, move)",
-                required=True
-            ),
-        ],
-    ),
-    "manage-archive": types.Prompt(
-        name="manage-archive",
-        description="Manage archived emails",
-        arguments=[
-            types.PromptArgument(
-                name="action",
-                description="What action to take with archives (archive, batch-archive, list, restore)",
-                required=True
-            ),
-        ],
-    ),
-}
+    @core_server.list_tools()
+    async def handle_list_tools() -> list[types.Tool]:
+        return get_tool_definitions()
+        ),
+        types.Tool(
+            name="list-filters",
+            description="Lists all email filters in the user's mailbox",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            },
+        ),
+        types.Tool(
+            name="get-filter",
+            description="Gets details of a specific filter",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filter_id": {
+                        "type": "string",
+                        "description": "Filter ID",
+                    },
+                },
+                "required": ["filter_id"],
+            },
+        ),
+        types.Tool(
+            name="create-filter",
+            description="Creates a new email filter",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_email": {
+                        "type": "string",
+                        "description": "Filter emails from this sender",
+                    },
+                    "to_email": {
+                        "type": "string",
+                        "description": "Filter emails to this recipient",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Filter emails with this subject",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Filter emails matching this query",
+                    },
+                    "has_attachment": {
+                        "type": "boolean",
+                        "description": "Filter emails with attachments",
+                    },
+                    "exclude_chats": {
+                        "type": "boolean",
+                        "description": "Exclude chats from filter",
+                    },
+                    "size_comparison": {
+                        "type": "string",
+                        "description": "Size comparison ('larger' or 'smaller')",
+                    },
+                    "size": {
+                        "type": "integer",
+                        "description": "Size in bytes for comparison",
+                    },
+                    "add_label_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Labels to add to matching emails",
+                    },
+                    "remove_label_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Labels to remove from matching emails",
+                    },
+                    "forward_to": {
+                        "type": "string",
+                        "description": "Email address to forward matching emails to",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="delete-filter",
+            description="Deletes a specific filter",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filter_id": {
+                        "type": "string",
+                        "description": "Filter ID",
+                    },
+                },
+                "required": ["filter_id"],
+            },
+        ),
+        types.Tool(
+            name="search-emails",
+            description="Searches for emails using Gmail's search syntax",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Gmail search query",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return",
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="create-folder",
+            description="Creates a new folder",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Folder name",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        types.Tool(
+            name="move-to-folder",
+            description="Moves an email to a folder",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                    "folder_id": {
+                        "type": "string",
+                        "description": "Folder ID",
+                    },
+                },
+                "required": ["email_id", "folder_id"],
+            },
+        ),
+        types.Tool(
+            name="list-folders",
+            description="Lists all user-created folders",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            },
+        ),
+        types.Tool(
+            name="archive-email",
+            description="Archives an email (removes from inbox without deleting)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID to archive",
+                    },
+                },
+                "required": ["email_id"],
+            },
+        ),
+        types.Tool(
+            name="batch-archive",
+            description="Archives multiple emails matching a search query",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Gmail search query to find emails to archive",
+                    },
+                    "max_emails": {
+                        "type": "integer",
+                        "description": "Maximum number of emails to archive (default: 100)",
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="list-archived",
+            description="Lists archived emails (not in inbox)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="restore-to-inbox",
+            description="Restores an archived email back to the inbox",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID to restore to inbox",
+                    },
+                },
+                "required": ["email_id"],
+            },
+        ),
+    ]
 
 
 def decode_mime_header(header: str) -> str: 
@@ -1323,11 +1341,11 @@ def register_handlers(service: GmailService) -> None:
 
     gmail_service = service
 
-    @server.list_prompts()
+    @core_server.list_prompts()
     async def handle_list_prompts() -> list[types.Prompt]:
         return list(PROMPTS.values())
 
-    @server.get_prompt()
+    @core_server.get_prompt()
     async def handle_get_prompt(
         name: str, arguments: dict[str, str] | None = None
     ) -> types.GetPromptResult:
@@ -2015,7 +2033,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             ),
         ]
 
-    @server.call_tool()
+    @core_server.call_tool()
     async def handle_call_tool(
         name: str, arguments: dict | None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
@@ -2256,7 +2274,96 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             logger.error(f"Unknown tool: {name}")
             raise ValueError(f"Unknown tool: {name}")
 
+    global _call_tool_handler
+    _call_tool_handler = handle_call_tool
     _handlers_registered = True
+
+
+def set_default_paths(creds_file_path: str | None, token_path: str | None) -> None:
+    global _default_creds_path, _default_token_path
+    _default_creds_path = creds_file_path
+    _default_token_path = token_path
+
+
+def ensure_service() -> GmailService:
+    global gmail_service
+
+    if gmail_service is None:
+        creds = _default_creds_path or os.getenv("GMAIL_CREDS_FILE")
+        token = _default_token_path or os.getenv("GMAIL_TOKEN_PATH")
+        gmail_service = GmailService(creds, token)
+        register_handlers(gmail_service)
+
+    return gmail_service
+
+
+def _json_type_to_py(json_type: str | list[str] | None) -> type:
+    if isinstance(json_type, list):
+        json_type = json_type[0] if json_type else None
+    mapping = {
+        "string": str,
+        "integer": int,
+        "number": float,
+        "boolean": bool,
+        "array": list,
+        "object": dict,
+    }
+    return mapping.get(json_type, str)
+
+
+def _make_fastmcp_tool(tool_def: types.Tool):
+    name = tool_def.name
+    description = tool_def.description or ""
+    input_schema = tool_def.inputSchema or {}
+    properties = input_schema.get("properties", {})
+    required = set(input_schema.get("required", []))
+
+    async def _tool(**kwargs):
+        ensure_service()
+        if _call_tool_handler is None:
+            raise RuntimeError("Tool handler is not initialized")
+        result = await _call_tool_handler(name, kwargs)
+        if isinstance(result, list) and result:
+            first = result[0]
+            text = getattr(first, "text", None)
+            if text is not None:
+                return text
+        return result
+
+    params = []
+    annotations: dict[str, Any] = {}
+    for prop_name, prop_schema in properties.items():
+        py_type = _json_type_to_py(prop_schema.get("type"))
+        if prop_name in required:
+            default = inspect._empty
+            ann = py_type
+        else:
+            default = None
+            ann = Optional[py_type]
+        params.append(
+            inspect.Parameter(
+                prop_name,
+                inspect.Parameter.KEYWORD_ONLY,
+                default=default,
+                annotation=ann,
+            )
+        )
+        annotations[prop_name] = ann
+
+    _tool.__name__ = f"tool_{name.replace('-', '_')}"
+    _tool.__annotations__ = annotations
+    _tool.__signature__ = inspect.Signature(params)
+
+    if fastmcp_server is not None:
+        fastmcp_server.tool(name=name, description=description)(_tool)
+
+
+def register_fastmcp_tools() -> None:
+    if fastmcp_server is None:
+        return
+
+    for tool_def in get_tool_definitions():
+        _make_fastmcp_tool(tool_def)
 
 
 async def main(creds_file_path: str | None,
@@ -2264,31 +2371,36 @@ async def main(creds_file_path: str | None,
                mode: str = 'mcp',
                port: int = 8000):
     
+    set_default_paths(creds_file_path, token_path)
     service = GmailService(creds_file_path, token_path)
     register_handlers(service)
 
     # Choose mode
     if mode == 'api':
         logger.info(f"Starting FastAPI server on port {port}")
-        app = create_fastapi_app(gmail_service, server)
+        app = create_fastapi_app(gmail_service, core_server)
         config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
         uvicorn_server = uvicorn.Server(config)
         await uvicorn_server.serve()
     else:
         # stdio mode for Claude Desktop
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-            await server.run(
+            await core_server.run(
                 read_stream,
                 write_stream,
                 InitializationOptions(
                     server_name="gmail",
                     server_version="0.1.0",
-                    capabilities=server.get_capabilities(
+                    capabilities=core_server.get_capabilities(
                         notification_options=NotificationOptions(),
                         experimental_capabilities={},
                     ),
                 ),
             )
+
+
+# Register FastMCP tools for cloud inspection/runtime
+register_fastmcp_tools()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Gmail API MCP Server')

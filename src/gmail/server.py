@@ -78,7 +78,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global MCP server (required for FastMCP Cloud inspection)
-server = Server("gmail")
+mcp = Server("gmail")
+server = mcp
+app = mcp
 gmail_service: "GmailService | None" = None
 _handlers_registered = False
 

@@ -1,9 +1,6 @@
 {
 	"folders": [
 		{
-			"path": "../Library/Application Support/Claude"
-		},
-		{
 			"path": "."
 		}
 	],

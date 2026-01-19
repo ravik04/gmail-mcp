@@ -112,6 +112,31 @@ Add the following to your Claude Desktop configuration file (typically at `~/Lib
 }
 ```
 
+### FastMCP Cloud (Personal Gmail)
+
+FastMCP Cloud cannot use the local desktop OAuth flow. Use environment-based OAuth with a refresh token:
+
+1. Run the server locally once to generate `tokens.json`:
+
+  ```bash
+  uv run gmail --creds-file-path /absolute/path/credentials.json --token-path /absolute/path/tokens.json
+  ```
+
+2. Open `tokens.json` and copy the `refresh_token` value.
+
+3. In FastMCP Cloud, set these environment variables:
+
+  - `GMAIL_CLIENT_ID` (from your Google OAuth client)
+  - `GMAIL_CLIENT_SECRET`
+  - `GMAIL_REFRESH_TOKEN`
+  - `GMAIL_TOKEN_URI` (optional, default is `https://oauth2.googleapis.com/token`)
+  - `GMAIL_DISABLE_LOCAL_OAUTH=1`
+
+4. Deploy the server. Use `--creds-file-path` and `--token-path` only if you still want file-based tokens.
+
+This works for personal Gmail accounts as long as the OAuth client is configured for Desktop app and your account is added as a test user.
+
+
 ### Testing with MCP Inspector
 
 For testing and debugging, use the MCP Inspector:

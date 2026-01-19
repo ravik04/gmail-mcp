@@ -9,3 +9,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# OAuth credentials and tokens
+credentials.json
+tokens.json
+
+# Local logs
+stdout.txt
+stderr.txt

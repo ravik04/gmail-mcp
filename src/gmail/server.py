@@ -1,22 +1,72 @@
-from typing import Any
+from typing import Any, Optional
 import argparse
 import os
 import asyncio
 import logging
 import base64
+import mimetypes
 from email.message import EmailMessage
 from email.header import decode_header
+from email.policy import default
 from base64 import urlsafe_b64decode
-from email import message_from_bytes
+from email import message_from_bytes, encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import webbrowser
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import StreamingResponse
+from pydantic import BaseModel
+import uvicorn
+from mcp.server.sse import SseServerTransport
 
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
 import mcp.server.stdio
 
+# FastAPI models
+class EmailSendRequest(BaseModel):
+    recipient_id: str
+    subject: str
+    message: str
 
-from google.auth.transport.requests import Request
+class DraftCreateRequest(BaseModel):
+    recipient_id: str
+    subject: str
+    message: str
+
+class DraftUpdateRequest(BaseModel):
+    draft_id: str
+    message: str
+
+class AttachmentRequest(BaseModel):
+    draft_id: str
+    file_path: str
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: Optional[int] = 50
+
+class LabelCreateRequest(BaseModel):
+    name: str
+
+class LabelApplyRequest(BaseModel):
+    email_id: str
+    label_id: str
+
+class FolderCreateRequest(BaseModel):
+    name: str
+
+class MoveFolderRequest(BaseModel):
+    email_id: str
+    folder_id: str
+
+
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -181,12 +231,12 @@ def decode_mime_header(header: str) -> str:
 
 class GmailService:
     def __init__(self,
-                 creds_file_path: str,
-                 token_path: str,
+                 creds_file_path: str | None,
+                 token_path: str | None,
                  scopes: list[str] = ['https://www.googleapis.com/auth/gmail.modify']):
         logger.info(f"Initializing GmailService with creds file: {creds_file_path}")
-        self.creds_file_path = creds_file_path
-        self.token_path = token_path
+        self.creds_file_path = os.path.expanduser(creds_file_path) if creds_file_path else None
+        self.token_path = os.path.expanduser(token_path) if token_path else None
         self.scopes = scopes
         self.token = self._get_token()
         logger.info("Token retrieved successfully")
@@ -195,27 +245,57 @@ class GmailService:
         self.user_email = self._get_user_email()
         logger.info(f"User email retrieved: {self.user_email}")
 
+    def _get_token_from_env(self) -> Credentials | None:
+        client_id = os.getenv("GMAIL_CLIENT_ID")
+        client_secret = os.getenv("GMAIL_CLIENT_SECRET")
+        refresh_token = os.getenv("GMAIL_REFRESH_TOKEN")
+        token_uri = os.getenv("GMAIL_TOKEN_URI", "https://oauth2.googleapis.com/token")
+
+        if client_id and client_secret and refresh_token:
+            logger.info("Loading token from environment variables")
+            token = Credentials(
+                token=None,
+                refresh_token=refresh_token,
+                token_uri=token_uri,
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=self.scopes,
+            )
+            token.refresh(GoogleRequest())
+            return token
+        return None
+
     def _get_token(self) -> Credentials:
         """Get or refresh Google API token"""
+        token = self._get_token_from_env()
+        if token:
+            return token
 
         token = None
-    
-        if os.path.exists(self.token_path):
+
+        if self.token_path and os.path.exists(self.token_path):
             logger.info('Loading token from file')
             token = Credentials.from_authorized_user_file(self.token_path, self.scopes)
 
         if not token or not token.valid:
             if token and token.expired and token.refresh_token:
                 logger.info('Refreshing token')
-                token.refresh(Request())
+                token.refresh(GoogleRequest())
             else:
+                if os.getenv("GMAIL_DISABLE_LOCAL_OAUTH") == "1":
+                    raise ValueError("Local OAuth is disabled and no env token was provided")
+                if not self.creds_file_path:
+                    raise ValueError("Missing creds file path and no env token was provided")
                 logger.info('Fetching new token')
                 flow = InstalledAppFlow.from_client_secrets_file(self.creds_file_path, self.scopes)
                 token = flow.run_local_server(port=0)
 
-            with open(self.token_path, 'w') as token_file:
-                token_file.write(token.to_json())
-                logger.info(f'Token saved to {self.token_path}')
+            if self.token_path:
+                # Ensure the directory for the token file exists
+                os.makedirs(os.path.dirname(os.path.abspath(self.token_path)), exist_ok=True)
+                with open(self.token_path, 'w') as token_file:
+                    token_file.write(token.to_json())
+                    logger.info(f'Token saved to {self.token_path}')
 
         return token
 
@@ -272,16 +352,18 @@ class GmailService:
             user_id = 'me'
             query = 'in:inbox is:unread category:primary'
 
-            response = self.service.users().messages().list(userId=user_id,
-                                                        q=query).execute()
+            response = await asyncio.to_thread(
+                self.service.users().messages().list(userId=user_id, q=query).execute
+            )
             messages = []
             if 'messages' in response:
                 messages.extend(response['messages'])
 
             while 'nextPageToken' in response:
                 page_token = response['nextPageToken']
-                response = self.service.users().messages().list(userId=user_id, q=query,
-                                                    pageToken=page_token).execute()
+                response = await asyncio.to_thread(
+                    self.service.users().messages().list(userId=user_id, q=query, pageToken=page_token).execute
+                )
                 messages.extend(response['messages'])
             return messages
 
@@ -291,7 +373,9 @@ class GmailService:
     async def read_email(self, email_id: str) -> dict[str, str]| str:
         """Retrieves email contents including to, from, subject, and contents."""
         try:
-            msg = self.service.users().messages().get(userId="me", id=email_id, format='raw').execute()
+            msg = await asyncio.to_thread(
+                self.service.users().messages().get(userId="me", id=email_id, format='raw').execute
+            )
             email_metadata = {}
 
             # Decode the base64URL encoded raw content
@@ -302,16 +386,27 @@ class GmailService:
             mime_message = message_from_bytes(decoded_data)
 
             # Extract the email body
-            body = None
+            body = ""
             if mime_message.is_multipart():
                 for part in mime_message.walk():
                     # Extract the text/plain part
                     if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode()
+                        payload = part.get_payload(decode=True)
+                        charset = part.get_content_charset() or 'utf-8'
+                        try:
+                            body = payload.decode(charset, errors='replace')
+                        except Exception:
+                            body = str(payload)
                         break
             else:
                 # For non-multipart messages
-                body = mime_message.get_payload(decode=True).decode()
+                payload = mime_message.get_payload(decode=True)
+                charset = mime_message.get_content_charset() or 'utf-8'
+                try:
+                    body = payload.decode(charset, errors='replace')
+                except Exception:
+                    body = str(payload)
+            
             email_metadata['content'] = body
             
             # Extract metadata
@@ -332,7 +427,9 @@ class GmailService:
     async def trash_email(self, email_id: str) -> str:
         """Moves email to trash given ID."""
         try:
-            self.service.users().messages().trash(userId="me", id=email_id).execute()
+            await asyncio.to_thread(
+                self.service.users().messages().trash(userId="me", id=email_id).execute
+            )
             logger.info(f"Email moved to trash: {email_id}")
             return "Email moved to trash successfully."
         except HttpError as error:
@@ -341,7 +438,9 @@ class GmailService:
     async def mark_email_as_read(self, email_id: str) -> str:
         """Marks email as read given ID."""
         try:
-            self.service.users().messages().modify(userId="me", id=email_id, body={'removeLabelIds': ['UNREAD']}).execute()
+            await asyncio.to_thread(
+                self.service.users().messages().modify(userId="me", id=email_id, body={'removeLabelIds': ['UNREAD']}).execute
+            )
             logger.info(f"Email marked as read: {email_id}")
             return "Email marked as read."
         except HttpError as error:
@@ -367,7 +466,105 @@ class GmailService:
             return {"status": "success", "draft_id": draft["id"]}
         except HttpError as error:
             return {"status": "error", "error_message": str(error)}
-    
+
+    async def update_draft(self, draft_id: str, message: str) -> dict:
+        """Updates the content of an existing draft"""
+        try:
+            # First get the existing draft to preserve headers
+            draft = await asyncio.to_thread(
+                self.service.users().drafts().get(userId="me", id=draft_id, format='full').execute
+            )
+            
+            # Extract headers from the existing message
+            existing_message = draft.get('message', {})
+            payload = existing_message.get('payload', {})
+            headers = payload.get('headers', [])
+            
+            subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), '')
+            to = next((h['value'] for h in headers if h['name'].lower() == 'to'), '')
+            
+            # Create a new EmailMessage with the updated content
+            message_obj = EmailMessage()
+            message_obj.set_content(message)
+            message_obj['To'] = to
+            message_obj['From'] = self.user_email
+            message_obj['Subject'] = subject
+
+            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+            update_body = {'message': {'raw': encoded_message}}
+            
+            updated_draft = await asyncio.to_thread(
+                self.service.users().drafts().update(userId="me", id=draft_id, body=update_body).execute
+            )
+            
+            logger.info(f"Draft updated: {updated_draft['id']}")
+            return {"status": "success", "draft_id": updated_draft["id"]}
+        except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+
+    async def add_attachment_to_draft(self, draft_id: str, file_path: str) -> dict:
+        """Adds an attachment to an existing draft using proper MIME handling"""
+        try:
+            # Validate file exists
+            full_path = os.path.abspath(os.path.expanduser(file_path))
+            if not os.path.exists(full_path):
+                return {"status": "error", "error_message": f"File not found: {full_path}"}
+            
+            # Get the existing draft with raw format
+            draft = await asyncio.to_thread(
+                self.service.users().drafts().get(userId="me", id=draft_id, format='raw').execute
+            )
+            
+            # Decode the raw message
+            raw_data = draft['message']['raw']
+            msg_bytes = base64.urlsafe_b64decode(raw_data.encode('utf-8'))
+            msg = message_from_bytes(msg_bytes)
+            
+            # Build new multipart message preserving headers
+            new_msg = MIMEMultipart()
+            for key, value in msg.items():
+                if key.lower() in ('content-type', 'mime-version'):
+                    continue
+                new_msg[key] = value
+            
+            # Attach original payload
+            if msg.is_multipart():
+                for part in msg.get_payload():
+                    new_msg.attach(part)
+            else:
+                payload = msg.get_payload(decode=True)
+                new_msg.attach(MIMEText(payload.decode('utf-8') if payload else '', _charset='utf-8'))
+            
+            # Add the new attachment
+            content_type, encoding = mimetypes.guess_type(full_path)
+            maintype, subtype = (content_type or 'application/octet-stream').split('/', 1)
+            
+            with open(full_path, 'rb') as f:
+                attachment_part = MIMEBase(maintype, subtype)
+                attachment_part.set_payload(f.read())
+            
+            encoders.encode_base64(attachment_part)
+            attachment_part.add_header(
+                'Content-Disposition', 
+                f'attachment; filename="{os.path.basename(full_path)}"'
+            )
+            new_msg.attach(attachment_part)
+            
+            # Encode and update the draft
+            encoded_message = base64.urlsafe_b64encode(new_msg.as_bytes()).decode('utf-8')
+            update_body = {'message': {'raw': encoded_message}}
+            
+            updated_draft = await asyncio.to_thread(
+                self.service.users().drafts().update(userId="me", id=draft_id, body=update_body).execute
+            )
+            
+            logger.info(f"Attachment added to draft: {updated_draft['id']}")
+            return {"status": "success", "draft_id": updated_draft["id"]}
+        except HttpError as error:
+            return {"status": "error", "error_message": str(error)}
+        except Exception as e:
+            return {"status": "error", "error_message": str(e)}
+
     async def list_drafts(self) -> list[dict] | str:
         """Lists all draft emails"""
         try:
@@ -967,19 +1164,166 @@ class GmailService:
             return f"Email restored to inbox successfully."
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
-  
-async def main(creds_file_path: str,
-               token_path: str):
+
+def create_fastapi_app(gmail_service: GmailService, server: Server):
+    app = FastAPI(title="Gmail MCP Server")
+    
+    # Add CORS middleware to allow ChatGPT to connect
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    sse = SseServerTransport("/messages")
+
+    @app.get("/")
+    async def root():
+        return {"status": "running", "mcp_endpoint": "/sse", "message": "Gmail MCP Server is active"}
+
+    @app.post("/sse")
+    async def sse_post(request: Request):
+        # Log the request but don't do much since standard MCP uses GET
+        body = await request.body()
+        logger.info(f"Received POST /sse with body: {body.decode()}")
+        return {"message": "POST /sse received, but MCP typically uses GET /sse"}
+
+    @app.post("/run")
+    async def run_post(request: Request):
+        # Handle "status" command seen in user logs
+        try:
+            body = await request.json()
+            if body.get("command") == "status":
+                return {"status": "ok", "message": "Gmail MCP Server is healthy"}
+        except:
+            pass
+        return {"status": "error", "message": "Unknown command"}
+
+    # Create ASGI handler for SSE connection
+    async def handle_sse_connection(scope, receive, send):
+        async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="gmail",
+                    server_version="0.1.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
+                ),
+            )
+
+    # Create ASGI handler for messages
+    async def handle_messages_post(scope, receive, send):
+        await sse.handle_post_message(scope, receive, send)
+
+    # Create ASGI wrapper class that intercepts SSE/messages at raw level
+    class MCPWrapper:
+        def __init__(self, app):
+            self.app = app
+        
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                path = scope.get("path", "")
+                method = scope.get("method", "GET")
+                logger.info(f"Incoming request: {method} {path}")
+                
+                if path == "/sse" and method == "GET":
+                    await handle_sse_connection(scope, receive, send)
+                    return
+                elif path.startswith("/messages") and method == "POST":
+                    await handle_messages_post(scope, receive, send)
+                    return
+                
+                # Special handling for weird ChatGPT behavior seen in logs
+                if path == "/run" or (path == "/sse" and method == "POST"):
+                    logger.warning(f"Unexpected request format: {method} {path}")
+            
+            # For all other requests, use the original FastAPI app
+            await self.app(scope, receive, send)
+
+    @app.post("/send-email")
+    async def send_email(req: EmailSendRequest):
+        return await gmail_service.send_email(req.recipient_id, req.subject, req.message)
+
+    @app.get("/unread-emails")
+    async def get_unread_emails():
+        return await gmail_service.get_unread_emails()
+
+    @app.get("/read-email/{email_id}")
+    async def read_email(email_id: str):
+        return await gmail_service.read_email(email_id)
+
+    @app.post("/trash-email/{email_id}")
+    async def trash_email(email_id: str):
+        return await gmail_service.trash_email(email_id)
+
+    @app.post("/create-draft")
+    async def create_draft(req: DraftCreateRequest):
+        return await gmail_service.create_draft(req.recipient_id, req.subject, req.message)
+
+    @app.post("/update-draft")
+    async def update_draft(req: DraftUpdateRequest):
+        return await gmail_service.update_draft(req.draft_id, req.message)
+
+    @app.post("/add-attachment")
+    async def add_attachment(req: AttachmentRequest):
+        return await gmail_service.add_attachment_to_draft(req.draft_id, req.file_path)
+
+    @app.get("/list-drafts")
+    async def list_drafts():
+        return await gmail_service.list_drafts()
+
+    @app.get("/list-labels")
+    async def list_labels():
+        return await gmail_service.list_labels()
+
+    @app.post("/create-label")
+    async def create_label(req: LabelCreateRequest):
+        return await gmail_service.create_label(req.name)
+
+    @app.post("/apply-label")
+    async def apply_label(req: LabelApplyRequest):
+        return await gmail_service.apply_label(req.email_id, req.label_id)
+
+    @app.get("/search-emails")
+    async def search_emails(query: str, max_results: int = 50):
+        return await gmail_service.search_emails(query, max_results)
+
+    @app.get("/list-folders")
+    async def list_folders():
+        return await gmail_service.list_folders()
+
+    @app.post("/archive-email/{email_id}")
+    async def archive_email(email_id: str):
+        return await gmail_service.archive_email(email_id)
+
+    @app.get("/list-archived")
+    async def list_archived(max_results: int = 50):
+        return await gmail_service.list_archived(max_results)
+    
+    # Return wrapped app for proper MCP SSE handling
+    return MCPWrapper(app)
+
+async def main(creds_file_path: str | None,
+               token_path: str | None,
+               mode: str = 'mcp',
+               port: int = 8000):
     
     gmail_service = GmailService(creds_file_path, token_path)
+    
+    # Create server instance (used for both modes)
     server = Server("gmail")
 
     @server.list_prompts()
-    async def list_prompts() -> list[types.Prompt]:
+    async def handle_list_prompts() -> list[types.Prompt]:
         return list(PROMPTS.values())
 
     @server.get_prompt()
-    async def get_prompt(
+    async def handle_get_prompt(
         name: str, arguments: dict[str, str] | None = None
     ) -> types.GetPromptResult:
         if name not in PROMPTS:
@@ -1306,6 +1650,42 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                     "type": "object",
                     "properties": {},
                     "required": []
+                },
+            ),
+            types.Tool(
+                name="update-draft",
+                description="Updates the content of an existing draft email",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "The ID of the draft to update",
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "The new email content text",
+                        },
+                    },
+                    "required": ["draft_id", "message"],
+                },
+            ),
+            types.Tool(
+                name="add-attachment-to-draft",
+                description="Adds a file attachment to an existing draft",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "The ID of the draft to update",
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "The absolute path to the file to attach",
+                        },
+                    },
+                    "required": ["draft_id", "file_path"],
                 },
             ),
             types.Tool(
@@ -1710,6 +2090,28 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
         elif name == "list-drafts":
             drafts = await gmail_service.list_drafts()
             return [types.TextContent(type="text", text=str(drafts), artifact={"type": "json", "data": drafts})]
+        elif name == "update-draft":
+            draft_id = arguments.get("draft_id")
+            message = arguments.get("message")
+            if not draft_id or not message:
+                raise ValueError("Missing required parameters for updating a draft")
+            update_response = await gmail_service.update_draft(draft_id, message)
+            if update_response["status"] == "success":
+                response_text = f"Draft updated successfully. Draft ID: {update_response['draft_id']}"
+            else:
+                response_text = f"Failed to update draft: {update_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text)]
+        elif name == "add-attachment-to-draft":
+            draft_id = arguments.get("draft_id")
+            file_path = arguments.get("file_path")
+            if not draft_id or not file_path:
+                raise ValueError("Missing required parameters for adding an attachment")
+            attach_response = await gmail_service.add_attachment_to_draft(draft_id, file_path)
+            if attach_response["status"] == "success":
+                response_text = f"Attachment added successfully to draft ID: {attach_response['draft_id']}"
+            else:
+                response_text = f"Failed to add attachment: {attach_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text)]
         elif name == "list-labels":
             labels = await gmail_service.list_labels()
             return [types.TextContent(type="text", text=str(labels), artifact={"type": "json", "data": labels})]
@@ -1849,28 +2251,51 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             logger.error(f"Unknown tool: {name}")
             raise ValueError(f"Unknown tool: {name}")
 
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="gmail",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
+    # Choose mode
+    if mode == 'api':
+        logger.info(f"Starting FastAPI server on port {port}")
+        app = create_fastapi_app(gmail_service, server)
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+        uvicorn_server = uvicorn.Server(config)
+        await uvicorn_server.serve()
+    else:
+        # stdio mode for Claude Desktop
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="gmail",
+                    server_version="0.1.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
                 ),
-            ),
-        )
+            )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Gmail API MCP Server')
     parser.add_argument('--creds-file-path',
-                        required=True,
+                        required=False,
                        help='OAuth 2.0 credentials file path')
     parser.add_argument('--token-path',
-                        required=True,
+                        required=False,
                        help='File location to store and retrieve access and refresh tokens for application')
+    parser.add_argument('--mode',
+                        choices=['mcp', 'api'],
+                        default='mcp',
+                        help='Run mode (mcp or api)')
+    parser.add_argument('--port',
+                        type=int,
+                        default=8000,
+                        help='Port for API mode')
     
     args = parser.parse_args()
-    asyncio.run(main(args.creds_file_path, args.token_path))
+
+    creds_path = args.creds_file_path or os.getenv("GMAIL_CREDS_FILE")
+    token_path = args.token_path or os.getenv("GMAIL_TOKEN_PATH")
+    env_port = os.getenv("PORT")
+    port = int(env_port) if env_port else args.port
+
+    asyncio.run(main(creds_path, token_path, args.mode, port))

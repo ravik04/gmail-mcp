@@ -17,9 +17,430 @@ from email.mime.text import MIMEText
 import webbrowser
 
 from fastapi import FastAPI, HTTPException, Request
-    @core_server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
-        return get_tool_definitions()
+from fastapi.responses import HTMLResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import StreamingResponse
+from pydantic import BaseModel
+import uvicorn
+from mcp.server.sse import SseServerTransport
+
+from mcp.server.models import InitializationOptions
+import mcp.types as types
+from mcp.server import NotificationOptions, Server
+import mcp.server.stdio
+
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# Global MCP servers
+core_server = Server("gmail")
+
+try:
+    from fastmcp import FastMCP
+    fastmcp_server = FastMCP("gmail")
+except Exception:
+    fastmcp_server = None
+
+# Expose standard names for FastMCP discovery
+mcp = fastmcp_server or core_server
+server = mcp
+app = mcp
+
+gmail_service: "GmailService | None" = None
+_handlers_registered = False
+_call_tool_handler: "Callable[[str, dict | None], Any] | None" = None
+_default_creds_path: str | None = None
+_default_token_path: str | None = None
+
+
+# FastAPI models
+class EmailSendRequest(BaseModel):
+    recipient_id: str
+    subject: str
+    message: str
+
+
+class DraftCreateRequest(BaseModel):
+    recipient_id: str
+    subject: str
+    message: str
+
+
+class DraftUpdateRequest(BaseModel):
+    draft_id: str
+    message: str
+
+
+class AttachmentRequest(BaseModel):
+    draft_id: str
+    file_path: str
+
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: Optional[int] = 50
+
+
+class LabelCreateRequest(BaseModel):
+    name: str
+
+
+class LabelApplyRequest(BaseModel):
+    email_id: str
+    label_id: str
+
+
+class FolderCreateRequest(BaseModel):
+    name: str
+
+
+class MoveFolderRequest(BaseModel):
+    email_id: str
+    folder_id: str
+
+
+EMAIL_ADMIN_PROMPTS = """You are an email administrator. 
+You can draft, edit, read, trash, open, and send emails.
+You've been given access to a specific gmail account. 
+You have the following tools available:
+- Send an email (send-email)
+- Create a draft email (create-draft)
+- List draft emails (list-drafts)
+- Retrieve unread emails (get-unread-emails)
+- Read email content (read-email)
+- Trash email (trash-email)
+- Open email in browser (open-email)
+- List all labels (list-labels)
+- Create a new label (create-label)
+- Apply a label to an email (apply-label)
+- Remove a label from an email (remove-label)
+- Rename a label (rename-label)
+- Delete a label (delete-label)
+- Search for emails with a specific label (search-by-label)
+- Search for emails using Gmail's search syntax (search-emails)
+- List all email filters (list-filters)
+- Get details of a specific filter (get-filter)
+"""
+
+PROMPTS = {
+    "manage-email": types.Prompt(
+        name="manage-email",
+        description="Manage email operations",
+        arguments=[],
+    ),
+    "draft-email": types.Prompt(
+        name="draft-email",
+        description="Draft an email",
+        arguments=[
+            types.PromptArgument(name="content", description="What the email is about", required=True),
+            types.PromptArgument(name="recipient", description="Recipient name", required=True),
+            types.PromptArgument(name="recipient_email", description="Recipient email", required=True),
+        ],
+    ),
+    "edit-draft": types.Prompt(
+        name="edit-draft",
+        description="Edit a draft email",
+        arguments=[
+            types.PromptArgument(name="changes", description="Changes to apply", required=True),
+            types.PromptArgument(name="current_draft", description="Current draft text", required=True),
+        ],
+    ),
+    "manage-label": types.Prompt(
+        name="manage-label",
+        description="Manage labels",
+        arguments=[
+            types.PromptArgument(name="action", description="create, apply, remove, rename, delete", required=True),
+        ],
+    ),
+    "manage-filter": types.Prompt(
+        name="manage-filter",
+        description="Manage email filters",
+        arguments=[
+            types.PromptArgument(name="action", description="create, list, get, delete", required=True),
+        ],
+    ),
+    "manage-archive": types.Prompt(
+        name="manage-archive",
+        description="Manage archived emails",
+        arguments=[
+            types.PromptArgument(name="action", description="archive, batch-archive, list, restore", required=True),
+        ],
+    ),
+}
+
+
+def get_tool_definitions() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="send-email",
+            description="""Sends email to recipient. 
+            Do not use if user only asked to draft email. 
+            Drafts must be approved before sending.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipient_id": {
+                        "type": "string",
+                        "description": "Recipient email address",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Email content text",
+                    },
+                },
+                "required": ["recipient_id", "subject", "message"],
+            },
+        ),
+        types.Tool(
+            name="trash-email",
+            description="""Moves email to trash. 
+            Confirm before moving email to trash.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                },
+                "required": ["email_id"],
+            },
+        ),
+        types.Tool(
+            name="get-unread-emails",
+            description="Retrieve unread emails",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            },
+        ),
+        types.Tool(
+            name="read-email",
+            description="Retrieves given email content",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                },
+                "required": ["email_id"],
+            },
+        ),
+        types.Tool(
+            name="mark-email-as-read",
+            description="Marks given email as read",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                },
+                "required": ["email_id"],
+            },
+        ),
+        types.Tool(
+            name="open-email",
+            description="Open email in browser",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                },
+                "required": ["email_id"],
+            },
+        ),
+        types.Tool(
+            name="create-draft",
+            description="Creates a draft email without sending it",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "recipient_id": {
+                        "type": "string",
+                        "description": "Recipient email address",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Email content text",
+                    },
+                },
+                "required": ["recipient_id", "subject", "message"],
+            },
+        ),
+        types.Tool(
+            name="list-drafts",
+            description="Lists all draft emails",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            },
+        ),
+        types.Tool(
+            name="update-draft",
+            description="Updates the content of an existing draft email",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "draft_id": {
+                        "type": "string",
+                        "description": "The ID of the draft to update",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The new email content text",
+                    },
+                },
+                "required": ["draft_id", "message"],
+            },
+        ),
+        types.Tool(
+            name="add-attachment-to-draft",
+            description="Adds a file attachment to an existing draft",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "draft_id": {
+                        "type": "string",
+                        "description": "The ID of the draft to update",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "The absolute path to the file to attach",
+                    },
+                },
+                "required": ["draft_id", "file_path"],
+            },
+        ),
+        types.Tool(
+            name="list-labels",
+            description="Lists all labels in the user's mailbox",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            },
+        ),
+        types.Tool(
+            name="create-label",
+            description="Creates a new label",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Label name",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        types.Tool(
+            name="apply-label",
+            description="Applies a label to an email",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID",
+                    },
+                },
+                "required": ["email_id", "label_id"],
+            },
+        ),
+        types.Tool(
+            name="remove-label",
+            description="Removes a label from an email",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email_id": {
+                        "type": "string",
+                        "description": "Email ID",
+                    },
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID",
+                    },
+                },
+                "required": ["email_id", "label_id"],
+            },
+        ),
+        types.Tool(
+            name="rename-label",
+            description="Renames an existing label",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID to rename",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "New name for the label",
+                    },
+                },
+                "required": ["label_id", "new_name"],
+            },
+        ),
+        types.Tool(
+            name="delete-label",
+            description="Permanently deletes a label",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID to delete",
+                    },
+                },
+                "required": ["label_id"],
+            },
+        ),
+        types.Tool(
+            name="search-by-label",
+            description="Searches for emails with a specific label",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label_id": {
+                        "type": "string",
+                        "description": "Label ID",
+                    },
+                },
+                "required": ["label_id"],
+            },
         ),
         types.Tool(
             name="list-filters",
